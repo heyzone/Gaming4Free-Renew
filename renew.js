@@ -9,7 +9,6 @@ const { chromium } = require("playwright");
 
 const RENEW_URL = process.env.RENEW_URL || "https://game4free.net/dkegdkegke-ege-ge-ge";
 
-// 格式: host:port:user:pass 或 host:port（无认证）
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const GOST_PORT    = parseInt(process.env.GOST_PORT || "18080", 10);
 const MAX_RETRY    = parseInt(process.env.MAX_RETRY || "2", 10);
@@ -64,18 +63,19 @@ async function dumpHTML(page, name) {
 
 /* ========================= GOST ========================= */
 
-/**
- * 将带认证的 SOCKS5 代理通过 gost 转为本地 HTTP 代理
- * Chrome 的 --proxy-server 不支持带认证的 socks5，需要 gost 中转
- */
 function parseProxy(raw) {
-  const parts = raw.split(":");
-  if (parts.length === 4) {
-    const [host, port, user, pass] = parts;
+  const idx1 = raw.indexOf(":");
+  const idx2 = raw.indexOf(":", idx1 + 1);
+  const idx3 = raw.indexOf(":", idx2 + 1);
+
+  if (idx3 !== -1) {
+    const host = raw.slice(0, idx1);
+    const port = raw.slice(idx1 + 1, idx2);
+    const user = raw.slice(idx2 + 1, idx3);
+    const pass = raw.slice(idx3 + 1);
     return { upstream: `socks5://${user}:${pass}@${host}:${port}` };
-  } else if (parts.length === 2) {
-    const [host, port] = parts;
-    return { upstream: `socks5://${host}:${port}` };
+  } else if (idx2 !== -1) {
+    return { upstream: `socks5://${raw}` };
   }
   throw new Error(`SOCKS5_PROXY 格式错误: ${raw}`);
 }
@@ -138,11 +138,11 @@ async function blockAds(context) {
   await context.route("**/*", (route) => {
     const url = route.request().url();
     if (
-      url.includes("doubleclick")     ||
+      url.includes("doubleclick")       ||
       url.includes("googlesyndication") ||
-      url.includes("adservice")       ||
-      url.includes("adsystem")        ||
-      url.includes("exoclick")        ||
+      url.includes("adservice")         ||
+      url.includes("adsystem")          ||
+      url.includes("exoclick")          ||
       url.includes("popads")
     ) {
       return route.abort();
@@ -162,22 +162,47 @@ async function hideAdsByCSS(page) {
   });
 }
 
-async function removeOverlay(page) {
-  await page.evaluate(() => {
-    document.querySelectorAll("*").forEach((el) => {
-      const s = window.getComputedStyle(el);
-      if (
-        s.position === "fixed" &&
-        parseInt(s.zIndex || "0") > 1000 &&
-        el.offsetWidth  > 200 &&
-        el.offsetHeight > 200 &&
-        !el.innerText.includes("Renew")
-      ) {
-        el.remove();
-      }
-    });
-    document.body.style.overflow = "auto";
-  });
+/* ========================= RECAPTCHA ========================= */
+
+async function clickRecaptchaCheckbox(page) {
+  console.log("☑️ 等待 reCAPTCHA iframe...");
+
+  const iframeHandle = await page.waitForSelector(
+    'iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"]',
+    { timeout: 60000 }
+  );
+
+  const frame = await iframeHandle.contentFrame();
+  if (!frame) throw new Error("❌ 无法获取 reCAPTCHA iframe frame");
+
+  const checkbox = await frame.waitForSelector("#recaptcha-anchor", { timeout: 30000 });
+
+  console.log("🖱️ 点击 reCAPTCHA checkbox...");
+  await checkbox.click({ force: true });
+  await page.waitForTimeout(2000);
+}
+
+async function waitRecaptchaToken(page, timeoutMs = 120000) {
+  console.log("⏳ 等待 reCAPTCHA token 生成...");
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    for (const frame of page.frames()) {
+      try {
+        const token = await frame.evaluate(() => {
+          const t = document.querySelector("textarea[name='g-recaptcha-response']");
+          return t?.value || "";
+        });
+        if (token && token.length > 30) {
+          console.log("✅ reCAPTCHA token 已生成:", token.slice(0, 12) + "...");
+          return token;
+        }
+      } catch {}
+    }
+    await page.waitForTimeout(2000);
+  }
+
+  throw new Error("❌ reCAPTCHA token 等待超时（2分钟）");
 }
 
 /* ========================= MAIN FLOW ========================= */
@@ -219,36 +244,29 @@ async function renewOnce(proxyServer) {
     await page.goto(RENEW_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(3000);
 
-    // ── 2. 等待 CF Turnstile 通过（最多 60 秒） ──
+    // ── 2. 等待 CF 盾通过 ──
     console.log("🛡️ 等待 Cloudflare 验证通过...");
     try {
-      // 等待 CF challenge 消失：body 不再是 challenge 页面
       await page.waitForFunction(
         () => !document.title.includes("Just a moment"),
         { timeout: 60000, polling: 2000 }
       );
       console.log("✅ CF 验证已通过");
     } catch {
-      console.log("⚠️ CF 验证等待超时，继续尝试...");
+      console.log("⚠️ CF 验证等待超时，继续...");
     }
 
     await page.waitForTimeout(2000);
     await hideAdsByCSS(page);
-    await removeOverlay(page);
-
     await snap(page, "page_loaded");
 
-    // ── 3. 找到输入框并填入随机英文名 ──
+    // ── 3. 填入随机英文名 ──
     console.log("✏️ 查找并填写英文名输入框...");
-
-    // 按优先级尝试多种 selector
     const inputSelectors = [
+      "input[placeholder*='name' i]",
       "input[name='name']",
       "input[id='name']",
-      "input[placeholder*='name' i]",
-      "input[placeholder*='Name']",
       "input[type='text']",
-      "input:not([type='hidden']):not([type='submit']):not([type='button'])",
     ];
 
     let filled = false;
@@ -259,7 +277,7 @@ async function renewOnce(proxyServer) {
         await el.click({ force: true });
         await el.fill("");
         await el.type(chosenName, { delay: 80 });
-        console.log(`✅ 已填入名字 "${chosenName}"，使用 selector: ${sel}`);
+        console.log(`✅ 已填入名字 "${chosenName}"，selector: ${sel}`);
         filled = true;
         break;
       } catch {}
@@ -267,54 +285,29 @@ async function renewOnce(proxyServer) {
 
     if (!filled) {
       await snap(page, "no_input_found");
-      await dumpHTML(page, "no_input_found");
       throw new Error("❌ 找不到英文名输入框");
     }
 
     await page.waitForTimeout(1000);
 
-    // ── 4. 点击 Renew 按钮 ──
-    console.log("🟢 查找并点击 Renew 按钮...");
+    // ── 4. 点击 reCAPTCHA checkbox ──
+    await clickRecaptchaCheckbox(page);
 
-    const renewSelectors = [
-      "button:has-text('Renew')",
-      "input[type='submit'][value*='Renew' i]",
-      "a:has-text('Renew')",
-      "[class*='renew' i]",
-      "button[type='submit']",
-    ];
+    // ── 5. 等待 reCAPTCHA token ──
+    await waitRecaptchaToken(page, 120000);
 
-    let clicked = false;
-    for (const sel of renewSelectors) {
-      try {
-        const btn = page.locator(sel).first();
-        await btn.waitFor({ state: "visible", timeout: 8000 });
-        await btn.click({ force: true });
-        console.log(`✅ 已点击 Renew 按钮，selector: ${sel}`);
-        clicked = true;
-        break;
-      } catch {}
-    }
+    await snap(page, "recaptcha_passed");
 
-    if (!clicked) {
-      await snap(page, "no_renew_btn");
-      await dumpHTML(page, "no_renew_btn");
-      throw new Error("❌ 找不到 Renew 按钮");
-    }
+    // ── 6. 等待按钮文字变为 "Renew" 后点击 ──
+    console.log("⏳ 等待按钮变为 Renew...");
+    const renewBtn = page.locator("button:has-text('Renew')");
+    await renewBtn.waitFor({ state: "visible", timeout: 30000 });
+    await renewBtn.click({ force: true });
+    console.log("✅ 已点击 Renew 按钮");
 
     await page.waitForTimeout(3000);
 
-    // ── 5. 点击后若再次出现 CF Turnstile（弹窗内），等待通过 ──
-    try {
-      await page.waitForFunction(
-        () => !document.title.includes("Just a moment"),
-        { timeout: 30000, polling: 2000 }
-      );
-    } catch {}
-
-    await page.waitForTimeout(2000);
-
-    // ── 6. 等待成功文字 ──
+    // ── 7. 等待成功文字 ──
     console.log("⏳ 等待续期成功提示...");
     try {
       await page.waitForFunction(
@@ -325,7 +318,7 @@ async function renewOnce(proxyServer) {
     } catch {
       await snap(page, "no_success_text");
       await dumpHTML(page, "no_success_text");
-      throw new Error("❌ 未检测到成功提示文字 'The server has been renewed'");
+      throw new Error("❌ 未检测到成功提示 'The server has been renewed'");
     }
 
     await snap(page, "renew_success");
@@ -351,10 +344,9 @@ async function renewOnce(proxyServer) {
 /* ========================= ENTRY ========================= */
 
 (async () => {
-  let gost      = null;
-  let proxyArg  = "";
+  let gost     = null;
+  let proxyArg = "";
 
-  // ── 启动 gost 代理转发 ──
   if (SOCKS5_PROXY) {
     try {
       gost     = await startGost(SOCKS5_PROXY, GOST_PORT);
@@ -381,7 +373,6 @@ async function renewOnce(proxyServer) {
     await sleep(5000);
   }
 
-  // ── 停止 gost ──
   if (gost) {
     try { gost.kill("SIGTERM"); console.log("🛑 gost 已停止"); } catch {}
   }
