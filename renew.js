@@ -3,7 +3,7 @@ const os = require("os");
 const path = require("path");
 const { chromium } = require("playwright");
 
-const TARGET = "https://game4free.net/game";
+const TARGET = "https://game4free.net/dkegdkegke-ege-ge-ge";
 
 const EXT_BUSTER = path.resolve(__dirname, "extensions/buster/unpacked");
 const SCREEN = path.resolve(__dirname, "screenshots");
