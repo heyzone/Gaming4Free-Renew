@@ -77,7 +77,7 @@ jobs:
         run: |
           mkdir -p scripts/extensions/buster
           wget -O scripts/extensions/buster/buster.zip \
-            https://github.com/dessant/buster/releases/download/v3.1.0/buster_captcha_solver_for_humans-3.1.0-chrome.zip
+            https://github.com/dessant/buster/releases/download/v3.1.2/buster_captcha_solver_for_humans-3.1.2-chrome.zip
 
       - name: Unzip Buster
         run: |
