@@ -42,10 +42,10 @@ jobs:
       # 🟡 1️⃣ WARP
       # =========================
       - name: 创建WARP网络
-        uses: fscarmen/warp-on-actions@v1.3
+        uses: fscarmen/warp-on-actions@v1.4
         with:
           stack: dual
-          mode: client
+          mode: wireguard
 
       # =========================
       # 🟡 2️⃣ 系统依赖（音频）
